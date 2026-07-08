@@ -14,6 +14,7 @@ if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
 // Ouverture de la base de données
 const db = new sqlite3.Database(DB_PATH);
 
+
 // On recrée la méthode .exec de manière compatible pour tes requêtes de création
 db.exec = function(sql) {
 db.serialize(() => {
