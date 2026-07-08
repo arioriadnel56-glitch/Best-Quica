@@ -1,20 +1,29 @@
-const Database = require('better-sqlite3');
+const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
-const fs   = require('fs');
+const fs = require('fs');
 
 // En production hébergée : utiliser /tmp ou un dossier persistant
-// Sur Render/Railway : monter un volume persistant sur /data
-const DB_DIR  = process.env.DB_PATH
-  ? path.dirname(process.env.DB_PATH)
-  : process.env.DATA_DIR || path.join(__dirname, '..', 'data');
+const DB_DIR = process.env.DB_PATH
+? path.dirname(process.env.DB_PATH)
+: process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 
 const DB_PATH = process.env.DB_PATH || path.join(DB_DIR, 'bestquinca.db');
 
 if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+// Ouverture de la base de données
+const db = new sqlite3.Database(DB_PATH);
+
+// On recrée la méthode .exec de manière compatible pour tes requêtes de création
+db.exec = function(sql) {
+db.serialize(() => {
+db.run(sql, (err) => {
+if (err) console.error("Erreur d'initialisation de la table:", err.message);
+});
+});
+};
+
+
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS stores (
