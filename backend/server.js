@@ -7,8 +7,8 @@ require('./database');
 
 const app  = express();
 const PORT = process.env.PORT || 8081;
-
 app.use(cors({ origin: '*' }));
+
 app.use(express.json({ limit: '25mb' }));
 
 // ── API Routes ─────────────────────────────────────────────────
