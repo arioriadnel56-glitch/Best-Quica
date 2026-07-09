@@ -16,13 +16,40 @@ const db = new sqlite3.Database(DB_PATH);
 
 
 // On recrée la méthode .exec de manière compatible pour tes requêtes de création
+// Émulation complète pour maintenir la compatibilité avec better-sqlite3
 db.exec = function(sql) {
 db.serialize(() => {
 db.run(sql, (err) => {
-if (err) console.error("Erreur d'initialisation de la table:", err.message);
+if (err) console.error("Erreur DDL:", err.message);
 });
 });
 };
+
+db.prepare = function(sql) {
+return {
+run: function(...params) {
+db.serialize(() => {
+db.run(sql, params, (err) => {
+if (err) console.error("Erreur d'insertion synchrone:", err.message);
+});
+});
+return { changes: 1, lastInsertRowid: 1 };
+},
+get: function(...params) {
+let result = {};
+db.serialize(() => {
+db.get(sql, params, (err, row) => {
+if (!err && row) {
+Object.assign(result, row);
+}
+});
+});
+return result;
+}
+};
+};
+
+
 
 
 
