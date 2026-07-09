@@ -1,30 +1,34 @@
-const express=require('express');const bcrypt=require('bcryptjs');const {v4:uuid}=require('uuid');
-const db=require('../database');const {authMiddleware,ownerOnly}=require('../middleware');
-const r=express.Router();
-r.get('/',authMiddleware,ownerOnly,(req,res)=>res.json(db.prepare('SELECT id,full_name,email,role,created_at FROM users WHERE store_id=?').all(req.user.storeId)));
-r.post('/',authMiddleware,ownerOnly,async(req,res)=>{
-  const {fullName,email,password,role}=req.body;
-  if(!fullName?.trim()||!email?.trim()||!password||!['owner','secretary'].includes(role))
-    return res.status(400).json({error:'Données invalides.'});
-  if(password.length<8) return res.status(400).json({error:'Mot de passe min. 8 caractères.'});
-  if(db.prepare('SELECT id FROM users WHERE email=?').get(email.toLowerCase().trim()))
-    return res.status(409).json({error:'E-mail déjà utilisé.'});
-  const id=uuid();
-  db.prepare('INSERT INTO users(id,store_id,full_name,email,password_hash,role) VALUES(?,?,?,?,?,?)').run(id,req.user.storeId,fullName.trim(),email.toLowerCase().trim(),await bcrypt.hash(password,12),role);
-  res.status(201).json(db.prepare('SELECT id,full_name,email,role,created_at FROM users WHERE id=?').get(id));
+const express = require('express');
+const { v4: uuidv4 } = require('uuid');
+const pool = require('../database');
+const { authMiddleware } = require('../middleware');
+const router = express.Router();
+
+router.get('/', authMiddleware, async (req, res) => {
+try {
+const result = await pool.query('SELECT * FROM team WHERE store_id = $1 ORDER BY full_name ASC', [req.user.store_id]);
+res.json(result.rows);
+} catch (e) { res.status(500).json({ error: 'Erreur serveur.' }); }
 });
-r.delete('/:id',authMiddleware,ownerOnly,(req,res)=>{
-  if(req.params.id===req.user.id) return res.status(400).json({error:'Impossible de supprimer votre propre compte.'});
-  if(!db.prepare('SELECT id FROM users WHERE id=? AND store_id=?').get(req.params.id,req.user.storeId))
-    return res.status(404).json({error:'Utilisateur introuvable.'});
-  db.prepare('DELETE FROM users WHERE id=?').run(req.params.id);
-  res.json({success:true});
+
+router.post('/', authMiddleware, async (req, res) => {
+const { fullName, phone, salary } = req.body;
+if (!fullName?.trim()) return res.status(400).json({ error: 'Nom obligatoire.' });
+try {
+const id = uuidv4();
+await pool.query('INSERT INTO team (id, store_id, full_name, phone, salary) VALUES ($1, $2, $3, $4, $5)', [id, req.user.store_id, fullName.trim(), phone || '', Number(salary) || 0]);
+const created = await pool.query('SELECT * FROM team WHERE id = $1', [id]);
+res.status(201).json(created.rows[0]);
+} catch (e) { res.status(500).json({ error: 'Erreur serveur.' }); }
 });
-r.get('/store',authMiddleware,(req,res)=>res.json(db.prepare('SELECT * FROM stores WHERE id=?').get(req.user.storeId)));
-r.put('/store',authMiddleware,ownerOnly,(req,res)=>{
-  const {name,city,phone,email,address,logo_base64,currency}=req.body;
-  if(!name?.trim()) return res.status(400).json({error:'Nom obligatoire.'});
-  db.prepare('UPDATE stores SET name=?,city=?,phone=?,email=?,address=?,logo_base64=?,currency=? WHERE id=?').run(name.trim(),city?.trim()||'',phone?.trim()||'',email?.trim()||'',address?.trim()||'',logo_base64||'',currency||'FCFA',req.user.storeId);
-  res.json(db.prepare('SELECT * FROM stores WHERE id=?').get(req.user.storeId));
+
+router.delete('/:id', authMiddleware, async (req, res) => {
+try {
+const result = await pool.query('DELETE FROM team WHERE id = $1 AND store_id = $2', [req.params.id, req.user.store_id]);
+if (result.rowCount === 0) return res.status(404).json({ error: 'Introuvable.' });
+res.json({ success: true });
+} catch (e) { res.status(500).json({ error: 'Erreur serveur.' }); }
 });
-module.exports=r;
+
+module.exports = router;
+

@@ -1,69 +1,110 @@
-const express=require('express');const {v4:uuid}=require('uuid');
-const db=require('../database');const {authMiddleware,ownerOnly}=require('../middleware');
-const r=express.Router();
+const express = require('express');
+const { v4: uuidv4 } = require('uuid');
+const pool = require('../database'); // Importation du pool PostgreSQL
+const { authMiddleware } = require('../middleware');
+const router = express.Router();
 
-r.get('/',authMiddleware,(req,res)=>{
-  const {from,to}=req.query;
-  let sql='SELECT s.*,m.name as material_name,m.unit_detail,m.unit_gros,m.category,c.name as client_name_ref FROM sales s LEFT JOIN materials m ON s.material_id=m.id LEFT JOIN clients c ON s.client_id=c.id WHERE s.store_id=?';
-  const p=[req.user.storeId];
-  if(from){sql+=' AND date(s.created_at)>=?';p.push(from);}
-  if(to){sql+=' AND date(s.created_at)<=?';p.push(to);}
-  res.json(db.prepare(sql+' ORDER BY s.created_at DESC').all(...p));
+// 1. RÉCUPÉRER TOUTES LES VENTES DE LA QUINCAILLERIE
+router.get('/', authMiddleware, async (req, res) => {
+const storeId = req.user.store_id;
+
+try {
+const result = await pool.query(
+`SELECT s.*, u.full_name as seller_name
+FROM sales s
+LEFT JOIN users u ON s.user_id = u.id
+WHERE s.store_id = $1
+ORDER BY s.created_at DESC`,
+[storeId]
+);
+res.json(result.rows);
+} catch (e) {
+console.error(e);
+res.status(500).json({ error: 'Erreur serveur lors de la récupération des ventes.' });
+}
 });
 
-r.post('/',authMiddleware,(req,res)=>{
-  const {materialId,qty,sale_type,clientId,client}=req.body;
-  if(!materialId||!qty||Number(qty)<=0) return res.status(400).json({error:'Produit et quantité requis.'});
-  if(!['detail','gros'].includes(sale_type)) return res.status(400).json({error:'Type de vente invalide.'});
-  const mat=db.prepare('SELECT * FROM materials WHERE id=? AND store_id=?').get(materialId,req.user.storeId);
-  if(!mat) return res.status(404).json({error:'Produit introuvable.'});
+// 2. ENREGISTRER UNE NOUVELLE VENTE (AVEC MISE À JOUR DES STOCKS)
+router.post('/', authMiddleware, async (req, res) => {
+const storeId = req.user.store_id;
+const userId = req.user.id;
+// On s'attend à recevoir la liste des articles : items = [{ materialId, quantity, unitPrice }]
+const { customerName, totalAmount, paymentMethod, items } = req.body;
 
-  // En gros: qty = nb de cartons/lots, déduire qty*qty_gros du stock
-  const qtyGros = sale_type==='gros' ? Number(qty)*mat.qty_gros : Number(qty);
-  if(qtyGros>mat.stock) return res.status(400).json({error:`Stock insuffisant. Stock: ${mat.stock} ${mat.unit_detail} (${Math.floor(mat.stock/mat.qty_gros)} ${mat.unit_gros}).`});
+if (!items || !Array.isArray(items) || items.length === 0) {
+return res.status(400).json({ error: 'Une vente doit contenir au moins un article.' });
+}
 
-  const unitPrice = sale_type==='gros' ? mat.price_gros : mat.price_detail;
-  const newStock  = mat.stock - qtyGros;
-  const clientName = client?.trim() || (clientId?db.prepare('SELECT name FROM clients WHERE id=?').get(clientId)?.name:'')||'';
-  const id=uuid();
+// Isolation d'un client du pool pour la transaction transactionnelle
+const client = await pool.connect();
 
-  db.transaction(()=>{
-    db.prepare('INSERT INTO sales(id,store_id,material_id,sale_type,qty,unit_price,client_id,client,created_by) VALUES(?,?,?,?,?,?,?,?,?)').run(id,req.user.storeId,materialId,sale_type,Number(qty),unitPrice,clientId||null,clientName,req.user.fullName);
-    db.prepare("UPDATE materials SET stock=?,updated_at=datetime('now') WHERE id=?").run(newStock,materialId);
-    db.prepare('INSERT INTO stock_movements(id,store_id,material_id,type,qty,qty_before,qty_after,sale_type,reason,ref_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(uuid(),req.user.storeId,materialId,'sale',qtyGros,mat.stock,newStock,sale_type,`Vente ${sale_type}`,id,req.user.fullName);
-  })();
+try {
+// Début de la transaction
+await client.query('BEGIN');
 
-  const sale=db.prepare('SELECT s.*,m.name as material_name,m.unit_detail,m.unit_gros FROM sales s LEFT JOIN materials m ON s.material_id=m.id WHERE s.id=?').get(id);
-  res.status(201).json(sale);
+const saleId = uuidv4();
+
+// 1. Insertion de la vente principale
+await client.query(
+`INSERT INTO sales (id, store_id, user_id, customer_name, total_amount, payment_method)
+VALUES ($1, $2, $3, $4, $5, $6)`,
+[
+saleId,
+storeId,
+userId,
+customerName?.trim() || 'Client Comptant',
+Number(totalAmount) || 0,
+paymentMethod || 'Espèces'
+]
+);
+
+// 2. Boucle de mise à jour des stocks pour chaque matériau vendu
+for (const item of items) {
+const { materialId, quantity } = item;
+
+// Vérifier si le matériau existe et récupérer son stock actuel
+const matCheck = await client.query(
+'SELECT stock_quantity, name FROM materials WHERE id = $1 AND store_id = $2',
+[materialId, storeId]
+);
+
+if (matCheck.rows.length === 0) {
+throw new Error(`Matériau introuvable.`);
+}
+
+const currentStock = Number(matCheck.rows[0].stock_quantity);
+const qtyToSubtract = Number(quantity);
+
+if (currentStock < qtyToSubtract) {
+return res.status(400).json({
+error: `Stock insuffisant pour le produit : ${matCheck.rows[0].name}. (Disponible: ${currentStock})`
+});
+}
+
+// Déduction du stock
+await client.query(
+'UPDATE materials SET stock_quantity = stock_quantity - $1 WHERE id = $2 AND store_id = $3',
+[qtyToSubtract, materialId, storeId]
+);
+}
+
+// Si tout s'est bien passé, on valide la transaction en base
+await client.query('COMMIT');
+
+// Récupération de la vente enregistrée pour la renvoyer au frontend
+const finalSale = await pool.query('SELECT * FROM sales WHERE id = $1', [saleId]);
+res.status(201).json(finalSale.rows[0]);
+
+} catch (e) {
+// En cas d'erreur ou de plantage, on annule TOUT (les stocks restent intacts)
+await client.query('ROLLBACK');
+console.error(e);
+res.status(500).json({ error: 'Erreur critique lors de l\'enregistrement de la vente.' });
+} finally {
+// Libération obligatoire du client
+client.release();
+}
 });
 
-r.delete('/:id',authMiddleware,ownerOnly,(req,res)=>{
-  const sale=db.prepare('SELECT * FROM sales WHERE id=? AND store_id=?').get(req.params.id,req.user.storeId);
-  if(!sale) return res.status(404).json({error:'Vente introuvable.'});
-  db.transaction(()=>{
-    const mat=db.prepare('SELECT * FROM materials WHERE id=?').get(sale.material_id);
-    if(mat){
-      const qtyRestore = sale.sale_type==='gros' ? sale.qty*mat.qty_gros : sale.qty;
-      const ns=mat.stock+qtyRestore;
-      db.prepare("UPDATE materials SET stock=?,updated_at=datetime('now') WHERE id=?").run(ns,sale.material_id);
-      db.prepare('INSERT INTO stock_movements(id,store_id,material_id,type,qty,qty_before,qty_after,reason,ref_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)').run(uuid(),req.user.storeId,sale.material_id,'return',qtyRestore,mat.stock,ns,'Annulation vente',sale.id,req.user.fullName);
-    }
-    db.prepare('DELETE FROM sales WHERE id=?').run(req.params.id);
-  })();
-  res.json({success:true});
-});
+module.exports = router;
 
-r.get('/stats',authMiddleware,(req,res)=>{
-  const t=new Date().toISOString().split('T')[0];
-  const gV=(sql,...p)=>db.prepare(sql).get(...p);
-  res.json({
-    todayRevenue: gV('SELECT COALESCE(SUM(qty*unit_price),0) as v FROM sales WHERE store_id=? AND date(created_at)=?',req.user.storeId,t).v,
-    todayCount:   gV('SELECT COUNT(*) as v FROM sales WHERE store_id=? AND date(created_at)=?',req.user.storeId,t).v,
-    todayGros:    gV("SELECT COALESCE(SUM(qty*unit_price),0) as v FROM sales WHERE store_id=? AND date(created_at)=? AND sale_type='gros'",req.user.storeId,t).v,
-    todayDetail:  gV("SELECT COALESCE(SUM(qty*unit_price),0) as v FROM sales WHERE store_id=? AND date(created_at)=? AND sale_type='detail'",req.user.storeId,t).v,
-    totalRevenue: gV('SELECT COALESCE(SUM(qty*unit_price),0) as v FROM sales WHERE store_id=?',req.user.storeId).v,
-    topProducts:  db.prepare('SELECT m.name,SUM(s.qty) as tq,SUM(s.qty*s.unit_price) as tc FROM sales s JOIN materials m ON s.material_id=m.id WHERE s.store_id=? GROUP BY s.material_id ORDER BY tc DESC LIMIT 10').all(req.user.storeId)
-  });
-});
-
-module.exports=r;
