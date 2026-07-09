@@ -11,7 +11,11 @@ ssl: isProduction ? { rejectUnauthorized: false } : false
 
 const initDB = async () => {
 try {
-// Une seule grande requête propre
+// Étape intermédiaire : Tester la connexion avant d'envoyer les grosses requêtes
+const clientTest = await pool.connect();
+console.log(">>> Connexion physique au serveur PostgreSQL réussie.");
+clientTest.release();
+
 await pool.query(`
 CREATE TABLE IF NOT EXISTS stores (
 id TEXT PRIMARY KEY,
@@ -108,12 +112,11 @@ FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE SET NULL
 
 console.log("=== PostgreSQL connecté avec succès et tables initialisées ===");
 } catch (err) {
-console.error("!!! Erreur critique lors de l'initialisation de PostgreSQL :", err.message);
-process.exit(1);
+console.error("!!! ERREUR DE CONNEXION POSTGRESQL :", err.message);
+// On ne coupe plus le serveur avec process.exit(1) pour laisser le temps de lire le log en ligne
 }
 };
 
 initDB();
 
 module.exports = pool;
-
